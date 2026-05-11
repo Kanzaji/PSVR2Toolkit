@@ -1,12 +1,10 @@
-#include "caesar_manager_hooks.h"
-#include "device_provider_proxy.h"
-
 #include "driver_hooks/aston_manager_hooks.h"
 #include "command_thread.h"
 #include "caesar_usb_thread.h"
 #include "config.h"
 #include "driver_hooks/caesar_manager_hooks.h"
 #include "driver_context_proxy.h"
+#include "device_provider_proxy.h"
 #include "driver_hooks/hmd_device_hooks.h"
 #include "hmd_driver_loader.h"
 #include "hook_lib.h"

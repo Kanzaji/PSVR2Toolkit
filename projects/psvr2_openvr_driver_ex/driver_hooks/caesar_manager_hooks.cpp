@@ -1,6 +1,7 @@
 #include "driver_interface/caesar_manager.h"
 #include "caesar_manager_hooks.h"
 
+#include "hmd_device_camera.h"
 #include "hmd_driver_loader.h"
 #include "hook_lib.h"
 #include "usb_thread_gaze.h"
@@ -52,7 +53,7 @@ namespace psvr2_toolkit {
 
       int64_t hmdToHostOffset;
 
-      CaesarManager__getIMUTimestampOffset2(CaesarManager__getInstance2(), &hmdToHostOffset);
+      CaesarManager::GetIMUTimestampOffset(CaesarManager::GetInstance(), &hmdToHostOffset);
 
       double timeOffset = (static_cast<int64_t>(hmdTimestamp) + hmdToHostOffset) / 1e6;
 
@@ -91,9 +92,6 @@ namespace psvr2_toolkit {
     HookLib::InstallHook(psie__psvr2__ShareManager_UploadImage,
         reinterpret_cast<void*>(sie__psvr2__ShareManager_UploadImageHook),
         reinterpret_cast<void**>(&sie__psvr2__ShareManager_UploadImage));
-
-    CaesarManager__getInstance2 = decltype(CaesarManager__getInstance2)(pHmdDriverLoader->GetBaseAddress() + 0x124c90);
-    CaesarManager__getIMUTimestampOffset2 = decltype(CaesarManager__getIMUTimestampOffset2)(pHmdDriverLoader->GetBaseAddress() + 0x1252e0);
   }
 
 }

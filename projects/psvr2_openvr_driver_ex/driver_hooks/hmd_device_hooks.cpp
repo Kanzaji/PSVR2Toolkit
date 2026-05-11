@@ -275,6 +275,15 @@ namespace psvr2_toolkit {
     return result;
   }
 
+  void *sie__psvr2__HmdDevice__GetComponentHook(void *thisptr, char *pchComponentNameAndVersion) {
+    if (strcmp(pchComponentNameAndVersion, vr::IVRCameraComponent_Version) == 0) {
+      HmdDeviceCamera *pHmdDeviceCamera = HmdDeviceCamera::Instance();
+      return pHmdDeviceCamera;
+    }
+
+    return sie__psvr2__HmdDevice__GetComponent(thisptr, pchComponentNameAndVersion);
+  }
+
   void (*sie__psvr2__HmdDevice__Deactivate)(void *) = nullptr;
   void sie__psvr2__HmdDevice__DeactivateHook(void *thisptr) {
     sie__psvr2__HmdDevice__Deactivate(thisptr);

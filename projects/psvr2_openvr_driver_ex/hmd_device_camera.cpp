@@ -1,5 +1,5 @@
+#include "driver_hooks/hmd_device_hooks.h"
 #include "hmd_device_camera.h"
-#include "hmd_device_hooks.h"
 #include "img_utils.h"
 #include "util.h"
 
