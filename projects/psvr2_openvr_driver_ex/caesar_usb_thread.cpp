@@ -4,20 +4,57 @@
 #include "libusb-1.0/libusb.h"
 #include "util.h"
 
+#include <atomic>
+#include <condition_variable>
 #include <debugapi.h>
 #include <mutex>
 #include <shared_mutex>
+#include <thread>
 
 #define IS_HANDLE_VALID(handle) (reinterpret_cast<uint64_t>(handle) != -1) 
 
 namespace psvr2_toolkit {
 
   static libusb_context* g_usbCtx = INVALID_CONTEXT_HANDLE;
-  static libusb_device_handle* g_devHandle = INVALID_DEVICE_HANDLE;
+  static std::atomic<libusb_device_handle*> g_devHandle{INVALID_DEVICE_HANDLE};
   static std::mutex g_devHandleMutex;
   static bool g_usbSimulatedDisconnect = false;
 
   static std::shared_mutex g_pendingOperationsMutex;
+
+  static std::atomic<bool> g_libusbThreadRunning{false};
+  static std::thread g_libusbThread;
+
+  namespace {
+    void LibusbEventThread() {
+      while (g_libusbThreadRunning) {
+        struct timeval tv = {0, 100000}; // 100ms
+        libusb_handle_events_timeout_completed(g_usbCtx, &tv, nullptr);
+      }
+    }
+
+    struct AsyncTransferState {
+      std::mutex mutex;
+      std::condition_variable cv;
+      int completed;
+      int transferred;
+      int status;
+
+      AsyncTransferState() : completed(0), transferred(0), status(0) {}
+    };
+
+    void LIBUSB_CALL AsyncTransferCallback(struct libusb_transfer* transfer) {
+      auto* state = static_cast<AsyncTransferState*>(transfer->user_data);
+      {
+        std::lock_guard<std::mutex> lock(state->mutex);
+        state->transferred = transfer->actual_length;
+        state->status = transfer->status;
+        state->completed = 1;
+        state->cv.notify_all();
+      }
+      libusb_free_transfer(transfer);
+    }
+  }
 
   void (*CaesarUsbThread::orig_destructor)(CaesarUsbThread* thisptr, bool shouldFree) = nullptr;
   void (*CaesarUsbThread::orig_threadLoop)(CaesarUsbThread* thisptr) = nullptr;
@@ -51,67 +88,99 @@ namespace psvr2_toolkit {
   void CaesarUsbThread::SetUsbConnectionState(bool connected) {
     std::lock_guard<std::mutex> lock(g_devHandleMutex);
     g_usbSimulatedDisconnect = !connected;
-    if (g_usbSimulatedDisconnect && IS_HANDLE_VALID(g_devHandle)) {
+    if (g_usbSimulatedDisconnect && IS_HANDLE_VALID(g_devHandle.load())) {
       // Wait for all pending operations to finish with an exclusive lock
       std::unique_lock<std::shared_mutex> opsLock(g_pendingOperationsMutex);
-      libusb_close(g_devHandle);
+      libusb_close(g_devHandle.load());
       g_devHandle = INVALID_DEVICE_HANDLE;
     }
   }
 
-  int CaesarUsbThread::TransferPipe(uint8_t pipeId, char* buffer, size_t length) {
+  int CaesarUsbThread::TransferPipe(uint8_t pipeId, char* buffer, size_t length, uint64_t timeoutMs) {
     std::shared_lock<std::shared_mutex> lock(g_pendingOperationsMutex);
     if (this->m_stopRequested != 0 || g_usbSimulatedDisconnect) {
       this->m_lastError = 0xfffffe74;
       return -1;
     }
-    if (!IS_HANDLE_VALID(this->m_devHandle)) {
+    if (!IS_HANDLE_VALID(this->m_devHandle) || this->m_devHandle != g_devHandle.load()) {
       this->m_lastError = 0xfffffe79;
       return -1;
     }
 
     bool isBulk = this->GetInterface() != 7;
 
-    int transferred = 0;
-    int result = 0;
-
-    if (isBulk) {
-      result = libusb_bulk_transfer(
-        this->m_devHandle,
-        pipeId,
-        (unsigned char*)buffer,
-        static_cast<int>(length),
-        &transferred,
-        1000);
-    } else {
-      result = libusb_interrupt_transfer(
-        this->m_devHandle,
-        pipeId,
-        (unsigned char*)buffer,
-        static_cast<int>(length),
-        &transferred,
-        1000);
+    libusb_transfer* transfer = libusb_alloc_transfer(0);
+    if (!transfer) {
+      this->m_lastError = LIBUSB_ERROR_NO_MEM;
+      return -1;
     }
 
-    if (result != 0) {
-      if (result == LIBUSB_ERROR_TIMEOUT) {
-        return 0;
+    AsyncTransferState state;
+
+    if (isBulk) {
+      libusb_fill_bulk_transfer(
+        transfer,
+        this->m_devHandle,
+        pipeId,
+        (unsigned char*)buffer,
+        static_cast<int>(length),
+        AsyncTransferCallback,
+        &state,
+        timeoutMs);
+    } else {
+      libusb_fill_interrupt_transfer(
+        transfer,
+        this->m_devHandle,
+        pipeId,
+        (unsigned char*)buffer,
+        static_cast<int>(length),
+        AsyncTransferCallback,
+        &state,
+        timeoutMs);
+    }
+
+    int submit_result = libusb_submit_transfer(transfer);
+    if (submit_result < 0) {
+      libusb_free_transfer(transfer);
+      this->m_lastError = submit_result;
+      return -1;
+    }
+
+    bool cancel_requested = false;
+    std::unique_lock<std::mutex> waitLock(state.mutex);
+    while (!state.completed) {
+      if (!cancel_requested && (this->m_stopRequested != 0 || g_usbSimulatedDisconnect)) {
+        OutputDebugStringA("Cancelling\n");
+        libusb_cancel_transfer(transfer);
+        cancel_requested = true;
       }
-      this->m_lastError = result;
-      return -1; // Only return -1 for actual fatal USB errors
+      state.cv.wait_for(waitLock, std::chrono::milliseconds(100));
+    }
+
+    int result = state.status;
+    int transferred = state.transferred;
+
+    if (result != LIBUSB_TRANSFER_COMPLETED) {
+      if (result == LIBUSB_TRANSFER_TIMED_OUT || result == LIBUSB_TRANSFER_CANCELLED) {
+        if (transferred == 0) return 0;
+      } else {
+        Util::DriverLog("[Error] {} transfer failed. (libusb_transfer_status={})", isBulk ? "Bulk" : "Interrupt", result);
+        this->m_lastError = result;
+        return -1; // Only return -1 for actual fatal USB errors
+      }
     }
 
     return transferred;
   }
 
-  int CaesarUsbThread::ControlCommand(uint8_t bIsSet, uint16_t reportId, void* buffer, uint16_t length, uint16_t value, uint16_t index, uint16_t& subcmd) {
+  int CaesarUsbThread::ControlCommand(uint8_t bIsSet, uint16_t reportId, void* buffer, uint16_t length, uint16_t value, uint16_t index, uint16_t& subcmd, uint64_t timeoutMs) {
     std::shared_lock<std::shared_mutex> lock(g_pendingOperationsMutex);
     if (this->m_stopRequested != 0 || g_usbSimulatedDisconnect) {
       this->m_lastError = 0xfffffdd4;
       Util::DriverLog("Stop requested. Report ID: {}", reportId);
       return -1;
     }
-    if (!IS_HANDLE_VALID(this->m_devHandle)) {
+    if (!IS_HANDLE_VALID(this->m_devHandle) || this->m_devHandle != g_devHandle.load()) {
       this->m_lastError = 0xfffffdcd;
       Util::DriverLog("No dev {}. Report ID: {}", (uint64_t)this, reportId);
       return -1;
@@ -144,30 +213,61 @@ namespace psvr2_toolkit {
       memcpy(payload.data, buffer, length);
     }
 
-    int result = libusb_control_transfer(
-      this->m_devHandle,
-      bmRequestType,
-      bRequest,
-      wValue,
-      wIndex,
-      reinterpret_cast<unsigned char*>(&payload),
-      wLength,
-      1000);
+    int total_length = LIBUSB_CONTROL_SETUP_SIZE + wLength;
+    unsigned char* control_buf = new unsigned char[total_length];
+    libusb_fill_control_setup(control_buf, bmRequestType, bRequest, wValue, wIndex, wLength);
+    memcpy(control_buf + LIBUSB_CONTROL_SETUP_SIZE, &payload, wLength);
 
-    if (result < 0) {
-      Util::DriverLog("[Error] {} Report failed. (libusb_error={})", bIsSet != 0 ? "Set" : "Get", result);
-      this->m_lastError = result;
+    libusb_transfer* transfer = libusb_alloc_transfer(0);
+    if (!transfer) {
+      delete[] control_buf;
+      this->m_lastError = LIBUSB_ERROR_NO_MEM;
       return -1;
-    } else if (bIsSet == 0 && buffer && length > 0) {
-      subcmd = payload.subcmd; // Doubles as a result, mostly for gaze.
-      memcpy(buffer, payload.data, length);
     }
+
+    AsyncTransferState state;
+    libusb_fill_control_transfer(transfer, this->m_devHandle, control_buf, AsyncTransferCallback, &state, timeoutMs);
+
+    int submit_result = libusb_submit_transfer(transfer);
+    if (submit_result < 0) {
+      libusb_free_transfer(transfer);
+      delete[] control_buf;
+      this->m_lastError = submit_result;
+      return -1;
+    }
+
+    bool cancel_requested = false;
+    std::unique_lock<std::mutex> waitLock(state.mutex);
+    while (!state.completed) {
+      if (!cancel_requested && (this->m_stopRequested != 0 || g_usbSimulatedDisconnect)) {
+        OutputDebugStringA("Cancelling\n");
+        libusb_cancel_transfer(transfer);
+        cancel_requested = true;
+      }
+      state.cv.wait_for(waitLock, std::chrono::milliseconds(100));
+    }
+
+    int result;
+    if (state.status == LIBUSB_TRANSFER_COMPLETED) {
+      result = state.transferred;
+      if (bIsSet == 0 && buffer && length > 0) {
+        memcpy(&payload, control_buf + LIBUSB_CONTROL_SETUP_SIZE, wLength);
+        subcmd = payload.subcmd; // Doubles as a result, mostly for gaze.
+        memcpy(buffer, payload.data, length);
+      }
+    } else {
+      Util::DriverLog("[Error] {} Report failed. (libusb_transfer_status={})", bIsSet != 0 ? "Set" : "Get", state.status);
+      this->m_lastError = state.status;
+      result = -1;
+    }
+
+    delete[] control_buf;
     return result;
   }
 
   int CaesarUsbThread::GetDescriptor(libusb_device_descriptor* pDest) {
     std::shared_lock<std::shared_mutex> lock(g_pendingOperationsMutex);
-    if (g_usbSimulatedDisconnect || !IS_HANDLE_VALID(this->m_devHandle)) {
+    if (g_usbSimulatedDisconnect || !IS_HANDLE_VALID(this->m_devHandle) || this->m_devHandle != g_devHandle.load()) {
       Util::DriverLog("No dev for descriptor");
       return 1;
     }
@@ -198,37 +298,62 @@ namespace psvr2_toolkit {
         return;
       }
 
-      if (IS_HANDLE_VALID(g_devHandle)) {
+      if (IS_HANDLE_VALID(g_devHandle.load())) {
         // Ping the device to see if it's still physically responding.
         uint16_t device_status = 0;
         int result = 0;
         {
           std::shared_lock<std::shared_mutex> pingLock(g_pendingOperationsMutex);
-          result = libusb_control_transfer(
-              g_devHandle,
-              LIBUSB_REQUEST_TYPE_STANDARD,
-              LIBUSB_REQUEST_GET_STATUS,
-              0,
-              0,
-              reinterpret_cast<unsigned char*>(&device_status),
-              sizeof(device_status),
-              100
-          );
+          
+          unsigned char control_buf[LIBUSB_CONTROL_SETUP_SIZE + sizeof(device_status)];
+          libusb_fill_control_setup(control_buf, LIBUSB_ENDPOINT_IN, LIBUSB_REQUEST_GET_STATUS, 0, 0, sizeof(device_status));
+          memcpy(control_buf + LIBUSB_CONTROL_SETUP_SIZE, &device_status, sizeof(device_status));
+
+          libusb_transfer* transfer = libusb_alloc_transfer(0);
+          if (transfer) {
+            AsyncTransferState state;
+            libusb_fill_control_transfer(transfer, g_devHandle.load(), control_buf, AsyncTransferCallback, &state, 0);
+
+            int submit_result = libusb_submit_transfer(transfer);
+            if (submit_result >= 0) {
+              bool cancel_requested = false;
+              std::unique_lock<std::mutex> waitLock(state.mutex);
+              while (!state.completed) {
+                if (!cancel_requested && (thisptr->m_stopRequested != 0 || g_usbSimulatedDisconnect)) {
+                  OutputDebugStringA("Cancelling\n");
+                  libusb_cancel_transfer(transfer);
+                  cancel_requested = true;
+                }
+                state.cv.wait_for(waitLock, std::chrono::milliseconds(100));
+              }
+              if (state.status == LIBUSB_TRANSFER_COMPLETED) {
+                result = state.transferred;
+              } else {
+                result = -1;
+              }
+            } else {
+              result = -1;
+              libusb_free_transfer(transfer);
+            }
+          } else {
+            result = -1;
+          }
         }
 
         bool device_present = (result >= 0);
 
         if (!device_present) {
+          Util::DriverLog("[Error] Control transfer ping failed. (libusb_error={})", result);
           Util::DriverLog("Device disconnected. Closing existing handle.");
 
           // Wait for all pending operations to finish with an exclusive lock
           std::unique_lock<std::shared_mutex> opsLock(g_pendingOperationsMutex);
-          libusb_close(g_devHandle);
+          libusb_close(g_devHandle.load());
           g_devHandle = INVALID_DEVICE_HANDLE;
         }
       }
 
-      if (!IS_HANDLE_VALID(g_devHandle) && IS_HANDLE_VALID(g_usbCtx)) {
+      if (!IS_HANDLE_VALID(g_devHandle.load()) && IS_HANDLE_VALID(g_usbCtx)) {
         g_devHandle = libusb_open_device_with_vid_pid(g_usbCtx, 0x054C, 0x0cde);
         if (g_devHandle == nullptr) {
           g_devHandle = INVALID_DEVICE_HANDLE;
@@ -236,7 +361,7 @@ namespace psvr2_toolkit {
       }
     }
 
-    thisptr->m_devHandle = g_devHandle;
+    thisptr->m_devHandle = g_devHandle.load();
 
     Util::DriverLog("Opened {} with handle {}", interfaceNum, (uint64_t)thisptr->m_devHandle);
 
@@ -267,7 +392,7 @@ namespace psvr2_toolkit {
     if (thisptr->m_winUsbActive != 0) {
       if (IS_HANDLE_VALID(thisptr->m_devHandle)) {
         std::lock_guard<std::mutex> lock(g_devHandleMutex);
-        if (thisptr->m_devHandle == g_devHandle && IS_HANDLE_VALID(g_devHandle)) {
+        if (thisptr->m_devHandle == g_devHandle.load() && IS_HANDLE_VALID(g_devHandle.load())) {
           libusb_release_interface(thisptr->m_devHandle, thisptr->GetInterface());
         }
         thisptr->m_devHandle = INVALID_DEVICE_HANDLE;
@@ -302,22 +427,19 @@ namespace psvr2_toolkit {
 
           if (IS_HANDLE_VALID(thisptr->m_devHandle)) {
             std::lock_guard<std::mutex> lock(g_devHandleMutex);
-            if (thisptr->m_devHandle == g_devHandle && IS_HANDLE_VALID(g_devHandle)) {
+            if (thisptr->m_devHandle == g_devHandle.load() && IS_HANDLE_VALID(g_devHandle.load())) {
               libusb_release_interface(thisptr->m_devHandle, thisptr->GetInterface());
             }
             thisptr->m_devHandle = INVALID_DEVICE_HANDLE;
           }
           thisptr->m_winUsbActive = 0;
-
-          // Wait a bit before we try again.
-          Sleep(500);
         }
       }
     }
 
     if (IS_HANDLE_VALID(thisptr->m_devHandle)) {
       std::lock_guard<std::mutex> lock(g_devHandleMutex);
-      if (thisptr->m_devHandle == g_devHandle && IS_HANDLE_VALID(g_devHandle)) {
+      if (thisptr->m_devHandle == g_devHandle.load() && IS_HANDLE_VALID(g_devHandle.load())) {
         libusb_release_interface(thisptr->m_devHandle, thisptr->GetInterface());
       }
       thisptr->m_devHandle = INVALID_DEVICE_HANDLE;
@@ -330,6 +452,9 @@ namespace psvr2_toolkit {
 
   void CaesarUsbThread::JoinThreadHook(CaesarUsbThread* thisptr) {
     OutputDebugStringA("Joining interface thread");
+
+    thisptr->m_stopRequested = 1;
+
     if (orig_joinThread) {
         orig_joinThread(thisptr);
     }
@@ -397,6 +522,9 @@ namespace psvr2_toolkit {
     uintptr_t baseAddr = pHmdDriverLoader->GetBaseAddress();
 
     libusb_init(&g_usbCtx);
+
+    g_libusbThreadRunning = true;
+    g_libusbThread = std::thread(LibusbEventThread);
 
     HookLib::InstallHook(reinterpret_cast<void*>(baseAddr + 0x1225a0),
                          reinterpret_cast<void*>(DestructorHook),
@@ -473,6 +601,17 @@ namespace psvr2_toolkit {
     Util::SetInstructionNOPAtAddress(reinterpret_cast<void*>(baseAddr + 0x123aee), 5);
     Util::SetInstructionNOPAtAddress(reinterpret_cast<void*>(baseAddr + 0x123b3e), 5);
     
+  }
+
+  void CaesarUsbThread::Stop() {
+    if (g_libusbThreadRunning) {
+      g_libusbThreadRunning = false;
+      if (g_libusbThread.joinable()) {
+        g_libusbThread.join();
+      }
+      libusb_exit(g_usbCtx);
+      g_usbCtx = INVALID_CONTEXT_HANDLE;
+    }
   }
 
 } // namespace psvr2_toolkit
