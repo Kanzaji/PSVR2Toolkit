@@ -53,6 +53,8 @@ namespace psvr2_toolkit {
     }
 
     CustomShareManager::createSingleton();
+    CustomShareManager::getSingleton()->setupCAPIPath();
+    
     CommandThread::Initialize();
 
     static DriverContextProxy *pDriverContextProxy = DriverContextProxy::Instance();
